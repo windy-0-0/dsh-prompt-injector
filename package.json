@@ -1,0 +1,38 @@
+{
+  "name": "dsh-prompt-injector",
+  "version": "0.1.0",
+  "private": true,
+  "description": "披露每一轮对话开始前被自动注入的全部提示词：系统提示词分段 / 运行时上下文 / 工具说明 / 变量 / AGENTS.md 工作区规则，在设置里完整可读可复制",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "prompt",
+    "transparency"
+  ]
+}

@@ -1,0 +1,4 @@
+# dsh-prompt-injector bundle patch —— 把插件行插进 profile 组合。
+- insert:
+    - id: prompt-injector
+      name: dsh-prompt-injector
