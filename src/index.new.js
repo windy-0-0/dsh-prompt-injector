@@ -101,29 +101,10 @@ function scopeOf(ctx, sessionId) {
   return undefined
 }
 
-
-/**
- * 「旁路」计数器：>0 时本插件的瀑布监听器**不过滤**，用于 dump 时取完整视图。
- *
- * 为什么需要：`system-prompt/assemble` 是瀑布，监听器会**就地删掉**被禁的段，
- * 于是 assemble() 的返回值里没有被禁的段 —— 界面若以此为准，"禁了就消失、用户无法恢复"。
- * 用计数（不是布尔）以免并发 dump 互相把旁路关掉。
- */
-let bypassDepth = 0
-
-/** 取「未过滤」的完整注入视图（只读，不改任何持久化状态）。 */
-async function assembleUnfiltered(ctx, sessionId) {
-  bypassDepth += 1
-  try {
-    return await ctx.systemPrompt.assemble({ scope: scopeOf(ctx, sessionId) })
-  } catch { return null } finally { bypassDepth -= 1 }
-}
-
 export function apply(ctx) {
   // ── ① 瀑布拦截：在官方组装流程里删掉被禁用的段（真实生效）──────────
   ctx.effect(() => ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
     try {
-      if (bypassDepth > 0) return next()   // dump 取全量视图期间不过滤
       const cfg = loadConfig()
       const keep = (arr, deny) => (Array.isArray(arr) && deny.length > 0)
         ? arr.filter((x) => !deny.includes(x && x.name))
@@ -154,12 +135,7 @@ export function apply(ctx) {
         const sessionId = url.searchParams.get('sessionId') || undefined
         const cfg = loadConfig()
         try {
-          // ⚠️ assemble() 返回的是**已过滤**结果（被禁的段根本不在里面）。
-          // 若直接展示，用户禁掉一段后就再也看不到它、无法恢复 —— 开关必须可逆。
-          // 因此这里再组装一次"未过滤"的完整视图（用独立 ctx 副本，不改全局状态），
-          // 以完整视图为准展示，并用 cfg 标注每段的启用状态。
-          const full = await assembleUnfiltered(ctx, sessionId)
-          const assembly = full ?? await ctx.systemPrompt.assemble({ scope: scopeOf(ctx, sessionId) })
+          const assembly = await ctx.systemPrompt.assemble({ scope: scopeOf(ctx, sessionId) })
           const wrap = (arr, deny) => (arr ?? []).map((x) => ({
             name: x.name,
             origin: originOf(x.name),
