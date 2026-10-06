@@ -14,16 +14,24 @@ export const inject = ['slots']
 const PREFIX = '/prompt-injector'
 
 async function getJSON(path) {
-  const r = await fetch(PREFIX + path, { cache: 'no-store' })
-  return await r.json()
+  try {
+    const r = await fetch(PREFIX + path, { cache: 'no-store' })
+    const t = await r.text()
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status} ${t.slice(0, 120)}` }
+    try { return JSON.parse(t) } catch { return { ok: false, error: `非 JSON 响应: ${t.slice(0, 120)}` } }
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) } }
 }
 async function postJSON(path, body) {
-  const r = await fetch(PREFIX + path, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  })
-  return await r.json()
+  try {
+    const r = await fetch(PREFIX + path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    })
+    const t = await r.text()
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status} ${t.slice(0, 120)}` }
+    try { return JSON.parse(t) } catch { return { ok: false, error: `非 JSON 响应: ${t.slice(0, 120)}` } }
+  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) } }
 }
 
 const btnStyle = {
@@ -32,7 +40,7 @@ const btnStyle = {
 }
 
 /** 每段一行：开关 + 名字 + 来源 + 字符数 + 展开看原文 */
-function Row({ kind, item, onToggle, busy }) {
+function Row({ kind, item, onToggle, busy, readonly }) {
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   return h('div', {
@@ -43,7 +51,7 @@ function Row({ kind, item, onToggle, busy }) {
   }, [
     h('div', { key: 'hd', style: { display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px' } }, [
       h('input', {
-        key: 'sw', type: 'checkbox', checked: !!item.enabled, disabled: busy,
+        key: 'sw', type: 'checkbox', checked: !!item.enabled, disabled: busy || readonly,
         title: item.enabled ? '点击禁用：这一段将不再进入请求' : '点击启用',
         style: { cursor: 'pointer', flex: '0 0 auto' },
         onChange: (e) => onToggle(kind, item.name, e.target.checked),
@@ -125,20 +133,82 @@ function Group({ kind, title, hint, items, onToggle, onResetAll, busy, tone, rea
   ])
 }
 
+
+/** 会话注入分组：这些内容不经 systemPrompt 组装，而是以 UserMessage 形式注入会话。
+ *  第一版整类漏掉了它们 —— 用户看到 skill/AGENTS.md 在列表里"根本没有"，就是这个原因。 */
+function SessionInjections({ sess }) {
+  const [onlyLive, setOnlyLive] = useState(true)
+  const [openKind, setOpenKind] = useState({})
+  if (!sess) return null
+  const live = (it) => it.inSurface
+  const groups = sess.groups.map((g) => {
+    const items = onlyLive ? g.items.filter(live) : g.items
+    return { ...g, shown: items, charsShown: items.reduce((n, x) => n + (x.chars || 0), 0), totalItems: g.items.length }
+  }).filter((g) => g.shown.length > 0)
+  const liveChars = sess.groups.flatMap((g) => g.items).filter(live).reduce((n, x) => n + (x.chars || 0), 0)
+  return h('section', { style: { marginTop: 22 } }, [
+    h('div', { key: 'h', style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' } }, [
+      h('strong', { key: 't', style: { fontSize: 15, color: '#4a7dd6' } }, '⑥ 会话注入（不经系统提示词组装的那一类）'),
+      h('span', { key: 'c', style: { fontSize: 12, opacity: 0.6 } },
+        `${groups.length} 类 · ${groups.reduce((n, g) => n + g.shown.length, 0)} 条 · ${liveChars.toLocaleString()} 字符在效`),
+      h('button', {
+        key: 'f', type: 'button', style: btnStyle, marginLeft: 'auto',
+        onClick: () => setOnlyLive((v) => !v),
+      }, onlyLive ? '只看当前生效' : '显示全部历史'),
+    ]),
+    h('p', { key: 'd', style: { fontSize: 12.5, opacity: 0.72, margin: '0 0 8px', lineHeight: 1.6 } },
+      '这些内容**不是**由 systemPrompt 组装出来的，而是各插件/机制以普通用户消息写进会话的（技能目录、AGENTS.md、记忆召回、运行时上下文、子代理消息…）。'
+      + '「当前生效」= 它仍在会话表面（surface）里、真正占用上下文；历史版本已被替换，不再计入。'),
+    ...groups.map((g) => {
+      const key = g.kind
+      const open = !!openKind[key]
+      return h('div', { key, style: { border: '1px solid rgba(128,128,128,.28)', borderRadius: 8, marginBottom: 8, overflow: 'hidden' } }, [
+        h('div', {
+          key: 'hd', style: { padding: '8px 10px', cursor: 'pointer' },
+          onClick: () => setOpenKind((s) => ({ ...s, [key]: !s[key] })),
+        }, [
+          h('div', { key: 'l1', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
+            h('span', { key: 'i', style: { fontSize: 11, opacity: 0.5 } }, open ? '▾' : '▸'),
+            h('strong', { key: 'n', style: { fontSize: 13 } }, g.title),
+            h('span', { key: 's', style: { marginLeft: 'auto', fontSize: 11.5, opacity: 0.6 } },
+              `${g.shown.length}${onlyLive && g.totalItems !== g.shown.length ? `/${g.totalItems}` : ''} 条 · ${g.charsShown.toLocaleString()} 字符`),
+          ]),
+          g.what ? h('div', { key: 'l2', style: { fontSize: 12, opacity: 0.7, marginTop: 3, lineHeight: 1.55 } }, `这是什么：${g.what}`) : null,
+          g.why ? h('div', { key: 'l3', style: { fontSize: 12, opacity: 0.6, marginTop: 2, lineHeight: 1.55 } }, `为什么要注入：${g.why}`) : null,
+        ]),
+        open ? h('div', { key: 'bd', style: { borderTop: '1px solid rgba(128,128,128,.2)', padding: 10, display: 'flex', flexDirection: 'column', gap: 6 } },
+          g.shown.map((it, i) => h(Row, {
+            key: `${key}-${i}`, kind: 'session', readonly: true, busy: true,
+            item: { name: `${it.name}${it.seq ? ` · seq=${it.seq}` : ''}`, origin: it.inSurface ? '当前生效' : '历史（已替换）', chars: it.chars, enabled: it.inSurface, text: it.text },
+            onToggle: () => {},
+          }))) : null,
+      ])
+    }),
+  ])
+}
+
 function InjectorPage() {
   const [data, setData] = useState(null)
   const [agents, setAgents] = useState(null)
+  const [sess, setSess] = useState(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
   const [flash, setFlash] = useState('')
 
   const load = useCallback(async () => {
     setBusy(true); setErr('')
+    const errs = []
     try {
-      const [d, a] = await Promise.all([getJSON('/api/dump'), getJSON('/api/agents')])
-      if (d.ok) setData(d); else setErr(d.error || '加载失败')
-      if (a.ok) setAgents(a)
-    } catch (e) { setErr(String(e)) } finally { setBusy(false) }
+      const [d, a, s2] = await Promise.all([
+        getJSON('/api/dump'), getJSON('/api/agents'), getJSON('/api/session-injections'),
+      ])
+      if (d.ok) setData(d); else errs.push(`注入清单: ${d.error}`)
+      if (a.ok) setAgents(a); else errs.push(`规则文件: ${a.error}`)
+      if (s2.ok) setSess(s2); else errs.push(`会话注入: ${s2.error}`)
+    } catch (e) { errs.push(String(e)) } finally {
+      setErr(errs.join(' ｜ '))
+      setBusy(false)
+    }
   }, [])
 
   useEffect(() => { void load() }, [load])
@@ -207,6 +277,7 @@ function InjectorPage() {
     overview,
     data ? h('div', { key: 'g', style: { fontSize: 12, opacity: 0.7, marginTop: 8 } },
       `当前启用约 ${Number(data.enabledGrandChars).toLocaleString()} 字符（≈${Math.round(data.enabledGrandChars / 3.2).toLocaleString()} tokens）` +
+      (sess ? ` ｜ 会话注入在效 ${Number(sess.groups.flatMap((g) => g.items).filter((i) => i.inSurface).reduce((n, x) => n + (x.chars || 0), 0)).toLocaleString()} 字符` : '') +
       (saved > 0 ? ` · 已关闭 ${Number(saved).toLocaleString()} 字符（≈${Math.round(saved / 3.2).toLocaleString()} tokens/轮）` : ' · 全部启用中') +
       ` · 读取于 ${new Date(data.at).toLocaleTimeString()}`) : null,
 
@@ -214,6 +285,7 @@ function InjectorPage() {
     data ? h(Group, { key: 'g2', kind: 'contexts', title: '② 运行时上下文（contexts）', hint: '每轮变化', items: data.contexts, onToggle: toggle, onResetAll: resetAll, busy }) : null,
     data ? h(Group, { key: 'g3', kind: 'tools', title: '③ 工具说明（tools）', hint: '工具名 + 描述 + 参数 schema，占大头', items: data.tools, onToggle: toggle, onResetAll: resetAll, busy }) : null,
     data ? h(Group, { key: 'g4', kind: 'variables', title: '④ 提示词变量（variables）', items: data.variables, onToggle: toggle, onResetAll: resetAll, busy }) : null,
+    sess ? h(SessionInjections, { key: 'g6', sess }) : null,
     agents ? h(Group, {
       key: 'g5', kind: 'agents', readonly: true, busy: true,
       title: '⑤ 工作区规则文件（AGENTS.md 一族）',

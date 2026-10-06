@@ -104,3 +104,50 @@ dsh plugin --profile web add github:windy-0-0/dsh-prompt-injector
 ## 许可
 
 MIT
+
+---
+
+## v0.3.0：补上整类漏掉的「会话注入」+ 每段写清功能
+
+### 修的是什么（用户实测反馈）
+
+> "每轮都会注入的 skill 在提示词列表里根本没有体现，而且每段提示词的功能还是不够清楚"
+
+两条都成立，根因是**注入其实有两大来源，第一版只读了一个**：
+
+| 来源 | 机制 | 第一版 |
+|---|---|---|
+| **系统提示词组装** | `ctx.systemPrompt.assemble()` → sections / contexts / tools / variables | ✅ 覆盖 |
+| **会话注入** | 各插件以**普通用户消息**写进会话（`source.kind` 标明来源） | ❌ **整类漏掉** |
+
+会话注入的实际种类（本机真实会话实测，按条数）：
+
+| `source.kind` | 是什么 | 本机实测 |
+|---|---|---|
+| `plugin` / form=recall | **memgas 长期记忆召回** | 69 条 |
+| `agent-instructions` | **AGENTS.md / CLAUDE.md 整段注入** | 14 条（当前生效 3 条 = 14,690 字符） |
+| `plugin` / dsh-system-prompt | **运行时上下文快照**（`Current runtime context…`） | 6 条 |
+| `skill-catalog` | **技能目录**（`<system-reminder>` + `<available_skills>`） | 4 条（1,995 字符/次） |
+| `plugin` / jobs·goal·compact·approval | 后台任务通知 / 目标状态 / 压缩检查点 / 权限变更 | 13 条 |
+| `goal` / `agent-message` / `subagent-settled` | 目标通知 / 子代理消息 / 子代理结束 | 8 条 |
+
+这些内容**不经过** `assemble()`，所以只读 systemPrompt 的清单里"根本没有 skill"。
+
+### 现在页面分成两大部分
+
+- **①–⑤**：系统提示词组装结果（可开关，关掉真不进请求）
+- **⑥ 会话注入**（新增）：按种类分组，每条给出
+  - **这是什么** —— 一句话说清它的作用
+  - **为什么要注入** —— 它解决什么问题
+  - **当前生效 / 历史** —— 只有仍在会话表面（surface）里的才真正占用上下文；
+    历史版本（如 AGENTS.md 改过多次留下的旧副本）已不生效、不计入
+  - 「只看当前生效 / 显示全部历史」切换
+
+顶部总览同时给出两侧合计：`系统提示词启用 N 字符 ｜ 会话注入在效 M 字符`。
+
+### 顺带修掉的一个静默卡死
+
+客户端 `getJSON` 原来直接 `await r.json()`，一旦某接口返回非 JSON 就抛异常，
+被外层 `catch` 吞掉 → 页面**永久卡在"正在读取…"**（截图实测 `stuck: true`）。
+现在三个接口**分开容错**（任一失败不影响其余），且错误**显示在页面上**而不是吞掉。
+

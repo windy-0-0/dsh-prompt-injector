@@ -101,124 +101,10 @@ function scopeOf(ctx, sessionId) {
   return undefined
 }
 
-
-/**
- * 「旁路」计数器：>0 时本插件的瀑布监听器**不过滤**，用于 dump 时取完整视图。
- *
- * 为什么需要：`system-prompt/assemble` 是瀑布，监听器会**就地删掉**被禁的段，
- * 于是 assemble() 的返回值里没有被禁的段 —— 界面若以此为准，"禁了就消失、用户无法恢复"。
- * 用计数（不是布尔）以免并发 dump 互相把旁路关掉。
- */
-let bypassDepth = 0
-
-/** 取「未过滤」的完整注入视图（只读，不改任何持久化状态）。 */
-async function assembleUnfiltered(ctx, sessionId) {
-  bypassDepth += 1
-  try {
-    return await ctx.systemPrompt.assemble({ scope: scopeOf(ctx, sessionId) })
-  } catch { return null } finally { bypassDepth -= 1 }
-}
-
-
-/** 注入类消息的种类 → 人类可读的说明（用户要的是"这段是干什么的"）。 */
-const KIND_INFO = {
-  'skill-catalog': { title: '技能目录（skill-catalog）', what: '告诉模型本会话有哪些「技能」可用（技能=可复用的任务指令包），并指示它在任务匹配时先调用 skill 工具加载。', why: '模型不知道有哪些技能就不会用；但它只给摘要，正文要加载后才进上下文。' },
-  'agent-instructions': { title: '工作区规则（AGENTS.md 等）', what: '把工作区/主目录里的 AGENTS.md、CLAUDE.md 等指令文件的内容整段注入。', why: '让模型遵守你写的项目规则；内容多长就注入多长，是常见的"每轮固定开销"。' },
-  'plugin': { title: '插件注入（运行时上下文 / 记忆 / 回调等）', what: '插件通过会话消息注入的内容：运行时上下文快照（如 dsh-super-injector 的环境说明）、长期记忆召回（memgas）、后台任务通知、压缩检查点等。', why: '这类注入以**普通用户消息**形式进入会话，历史里会一直保留。' },
-  'goal': { title: '目标状态通知（goal）', what: '会话目标的状态变化（创建/完成/被阻塞）通知。', why: '让模型知道长期目标进展。' },
-  'agent-message': { title: '子代理消息', what: '子代理回传给父会话的消息。', why: '父会话需要看到子代理的产出。' },
-  'subagent-settled': { title: '子代理结束通知', what: '某个子代理运行结束的通知。', why: '让父会话知道可以收敛。' },
-  'user-approval': { title: '审批/权限变更通知', what: '审批策略或权限模式发生变化时的通知。', why: '让模型知道现在的授权边界。' },
-  'compaction': { title: '上下文压缩检查点', what: '自动压缩生成的检查点摘要，用于替代被压缩掉的历史。', why: '压缩后模型靠它理解前文。' },
-}
-
-function describeKind(kind, src) {
-  const info = KIND_INFO[kind]
-  const who = src && src.plugin ? String(src.plugin) : ''
-  const form = src && src.form ? String(src.form) : ''
-  const base = info ? `${info.title}` : `其它注入（${kind}）`
-  const title = who ? `${base} · ${who}${form ? ` · ${form}` : ''}` : base
-  const what = info ? info.what : '会话中被注入的一段内容（来源未在已知种类表中，请展开看正文判断）。'
-  const why = info ? info.why : ''
-  const sections = Array.isArray(src && src.sections)
-    ? src.sections.map((x) => ({ name: x && x.name, chars: ((x && x.text) || '').length }))
-    : null
-  return { title, what, why, sections }
-}
-
-/**
- * 读某个会话的注入类消息。
- *
- * 为什么要单独做：这些内容**不经过** `systemPrompt.assemble()`，
- * 而是以 UserMessage 形式写进会话（source.kind 标明来源）。
- * 只读 systemPrompt 会整类漏掉它们 —— 这正是用户反馈"skill 在列表里根本没有"的原因。
- */
-async function readSessionInjections(ctx, sessionId, limit) {
-  const sessions = ctx.get('sessions')
-  if (!sessions) throw new Error('sessions 服务不可用')
-  let session = sessionId ? sessions.get(sessionId) : undefined
-  if (!session) {
-    // 未指定就取最近一个会话
-    const list = typeof sessions.list === 'function' ? sessions.list() : []
-    session = list[list.length - 1]
-  }
-  if (!session) throw new Error('找不到会话（请带 sessionId 参数）')
-  const sid = session.id ?? sessionId ?? null
-  const events = typeof session.snapshotEvents === 'function'
-    ? session.snapshotEvents()
-    : (typeof session.events === 'function' ? session.events() : [])
-  // 只保留「仍在当前表面（surface）里」的注入：被压缩/替换掉的不再占用上下文
-  const surface = new Set(session.surface && session.surface.nodes ? session.surface.nodes : [])
-  const seen = new Map()
-  for (const ev of events) {
-    if (!ev || ev.type !== 'user/message') continue
-    const d = ev.data || {}
-    const src = d.source || {}
-    const kind = String(src.kind || '')
-    if (!kind || kind === 'user') continue      // 用户自己的消息不算注入
-    const inSurface = surface.size === 0 ? true : surface.has(ev.seq)
-    const blocks = Array.isArray(d.content) ? d.content : []
-    const text = blocks.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('\n')
-    if (!text) continue
-    const info = describeKind(kind, src)
-    const key = `${kind}|${src.plugin || ''}|${src.form || ''}|${text.length}`
-    const item = {
-      kind, inSurface, seq: ev.seq,
-      name: info.title, what: info.what, why: info.why,
-      origin: src.plugin ? String(src.plugin) : (kind === 'agent-instructions' ? 'AGENTS.md 机制' : kind),
-      chars: text.length,
-      sections: info.sections,
-      text: text.length > 200000 ? text.slice(0, 200000) + '\n…（已截断）' : text,
-      at: ev.time ? new Date(ev.time).toISOString() : null,
-    }
-    const cur = seen.get(key)
-    // 同形态保留最后一条（最新覆盖旧的）
-    if (!cur || (ev.seq ?? 0) >= (cur.seq ?? 0)) seen.set(key, item)
-  }
-  const items = [...seen.values()].sort((a, b) => (b.chars || 0) - (a.chars || 0))
-  const groups = {}
-  for (const it of items) {
-    const g = groups[it.kind] || (groups[it.kind] = {
-      kind: it.kind,
-      title: (KIND_INFO[it.kind] && KIND_INFO[it.kind].title) || `其它注入（${it.kind}）`,
-      what: (KIND_INFO[it.kind] && KIND_INFO[it.kind].what) || '',
-      why: (KIND_INFO[it.kind] && KIND_INFO[it.kind].why) || '',
-      items: [], chars: 0,
-    })
-    g.items.push(it); g.chars += it.chars || 0
-  }
-  return {
-    sessionId: sid,
-    total: { kinds: Object.keys(groups).length, items: items.length, chars: items.reduce((n, x) => n + x.chars, 0) },
-    groups: Object.values(groups).sort((a, b) => b.chars - a.chars),
-  }
-}
-
 export function apply(ctx) {
   // ── ① 瀑布拦截：在官方组装流程里删掉被禁用的段（真实生效）──────────
   ctx.effect(() => ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
     try {
-      if (bypassDepth > 0) return next()   // dump 取全量视图期间不过滤
       const cfg = loadConfig()
       const keep = (arr, deny) => (Array.isArray(arr) && deny.length > 0)
         ? arr.filter((x) => !deny.includes(x && x.name))
@@ -249,12 +135,7 @@ export function apply(ctx) {
         const sessionId = url.searchParams.get('sessionId') || undefined
         const cfg = loadConfig()
         try {
-          // ⚠️ assemble() 返回的是**已过滤**结果（被禁的段根本不在里面）。
-          // 若直接展示，用户禁掉一段后就再也看不到它、无法恢复 —— 开关必须可逆。
-          // 因此这里再组装一次"未过滤"的完整视图（用独立 ctx 副本，不改全局状态），
-          // 以完整视图为准展示，并用 cfg 标注每段的启用状态。
-          const full = await assembleUnfiltered(ctx, sessionId)
-          const assembly = full ?? await ctx.systemPrompt.assemble({ scope: scopeOf(ctx, sessionId) })
+          const assembly = await ctx.systemPrompt.assemble({ scope: scopeOf(ctx, sessionId) })
           const wrap = (arr, deny) => (arr ?? []).map((x) => ({
             name: x.name,
             origin: originOf(x.name),
@@ -318,20 +199,6 @@ export function apply(ctx) {
         else for (const k of KINDS) cfg[k] = []
         try { saveConfig(cfg) } catch (e) { return json(res, { ok: false, error: `写入失败: ${e}` }, 500) }
         return json(res, { ok: true, disabled: cfg })
-      }
-
-      // ── 会话注入类消息（skill-catalog / AGENTS.md / memgas / 运行时上下文 …）──
-      // 第一版整类漏掉了它们：这些内容**不是**经 systemPrompt 组装的，
-      // 而是以 source.kind='plugin'|'skill-catalog'|'agent-instructions' 的 UserMessage 注入会话。
-      if (req.method === 'GET' && path === '/api/session-injections') {
-        const sessionId = url.searchParams.get('sessionId') || url.searchParams.get('session')
-        const limit = Math.min(Number(url.searchParams.get('limit') || 200), 500)
-        try {
-          const x = await readSessionInjections(ctx, sessionId, limit)
-          return json(res, { ok: true, sessionId: x.sessionId, groups: x.groups, total: x.total })
-        } catch (e) {
-          return json(res, { ok: false, error: String(e && e.message ? e.message : e) }, 500)
-        }
       }
 
       if (req.method === 'GET' && path === '/api/agents') {
